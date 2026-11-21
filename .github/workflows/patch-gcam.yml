@@ -32,8 +32,12 @@ jobs:
           # sanity check: a real APK is a zip containing AndroidManifest.xml
           unzip -l GCam.apk | grep -q AndroidManifest.xml || {
             echo "Downloaded file is not an APK (link is probably a web page, not a direct link)"; exit 1; }
+          echo "--- native libs in the original APK ---"
+          unzip -Z1 GCam.apk | grep '^lib/' | sort || true
 
-      # -r keeps resources.arsc untouched, smali is still decoded
+      # Used only to get patched dex files. The final APK is the ORIGINAL apk
+      # with just those dex files swapped, so manifest, resources and native
+      # libs (the MGC shim libs) stay byte-identical.
       - name: Decompile
         run: java -jar apktool.jar d -r -f GCam.apk -o out
 
@@ -50,6 +54,15 @@ jobs:
               r"Landroid/hardware/SensorDirectChannel;\s*\n\s*"
               r"move-result-object (v\d+)\n")
 
+          def dex_for(path):
+              top = path.relative_to("out").parts[0]
+              if top == "smali":
+                  return "classes.dex"
+              m = re.fullmatch(r"smali_classes(\d+)", top)
+              if not m:
+                  sys.exit(f"PATCH FAILED: cannot map {path} to a dex file")
+              return f"classes{m.group(1)}.dex"
+
           hits = []
           for p in pathlib.Path("out").rglob("*.smali"):
               s = p.read_text(encoding="utf-8", errors="ignore")
@@ -61,22 +74,39 @@ jobs:
               sys.exit("PATCH FAILED: no createDirectChannel call found "
                        "(this GCam build may not use direct gyro - nothing to patch)")
 
-          total = 0
+          total, dexes = 0, set()
           for p, s in hits:
               new, n = CALL.subn(lambda m: f"    const/4 {m.group(1)}, 0x0\n", s)
               if n:
                   p.write_text(new, encoding="utf-8")
                   print(f"patched {p}: {n} call(s)")
                   total += n
+                  dexes.add(dex_for(p))
           if total == 0:
               sys.exit("PATCH FAILED: createDirectChannel found but pattern did not match; "
                        "send the smali around it so the pattern can be adjusted")
+
+          open("patched_dex.txt", "w").write("\n".join(sorted(dexes)) + "\n")
+          print("dex files to replace:", sorted(dexes))
           PY
 
-      - name: Rebuild
+      - name: Rebuild (only to get the patched dex)
         run: |
-          java -jar apktool.jar b out -o unsigned.apk
-          ls -lh unsigned.apk
+          java -jar apktool.jar b out -o rebuilt.apk
+          ls -lh rebuilt.apk
+
+      - name: Put patched dex into the original APK
+        run: |
+          mkdir dex_out
+          unzip -o rebuilt.apk $(cat patched_dex.txt) -d dex_out
+          cp GCam.apk work.apk
+          # drop the old signature, it is invalid after the change anyway
+          zip -q -d work.apk 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' 'META-INF/*.EC' 'META-INF/MANIFEST.MF' || true
+          (cd dex_out && zip -q -X "$GITHUB_WORKSPACE/work.apk" $(cat "$GITHUB_WORKSPACE/patched_dex.txt"))
+          for d in $(cat patched_dex.txt); do
+            echo -n "$d: createDirectChannel references left = "
+            unzip -p work.apk "$d" | grep -a -c createDirectChannel || true
+          done
 
       # Keep the same signing key between runs so updates install over each other
       - name: Restore signing key
@@ -92,11 +122,29 @@ jobs:
             keytool -genkeypair -keystore gcam.jks -storepass android -keypass android \
               -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=bsg-gcam-patch"
           fi
-          $BT/zipalign -p -f 4 unsigned.apk aligned.apk
+          $BT/zipalign -p -f 4 work.apk aligned.apk
           $BT/apksigner sign --ks gcam.jks --ks-pass pass:android --key-pass pass:android \
             --out "GCam-patched.apk" aligned.apk
           $BT/apksigner verify -v GCam-patched.apk | head -5
           ls -lh GCam-patched.apk
+
+      # Everything except the patched dex files must match the original exactly
+      - name: Verify only dex changed
+        run: |
+          python3 - <<'PY'
+          import zipfile, re, sys
+          o = zipfile.ZipFile("GCam.apk")
+          p = zipfile.ZipFile("GCam-patched.apk")
+          oi = {i.filename: i.CRC for i in o.infolist() if not i.filename.startswith("META-INF/")}
+          pi = {i.filename: i.CRC for i in p.infolist() if not i.filename.startswith("META-INF/")}
+          changed = sorted(n for n in oi if pi.get(n) != oi[n])
+          print("changed or missing entries:", changed)
+          print("new entries:", sorted(set(pi) - set(oi)))
+          bad = [n for n in changed if not re.fullmatch(r"classes\d*\.dex", n)]
+          if bad or set(pi) - set(oi):
+              sys.exit(f"UNEXPECTED DIFFERENCES: {bad}")
+          print("OK: only dex files differ from the original")
+          PY
 
       - uses: actions/upload-artifact@v4
         with:
