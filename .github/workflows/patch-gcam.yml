@@ -1,0 +1,104 @@
+name: Patch MGC (BSG) GCam (disable direct gyro channel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gcam_url:
+        description: "Direct download link of the MGC (BSG) GCam APK"
+        required: true
+      apktool_version:
+        description: "apktool version"
+        default: "2.9.3"
+
+permissions:
+  contents: read
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    env:
+      GCAM_URL: ${{ inputs.gcam_url }}
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-jre-headless zip unzip
+          wget -q "https://github.com/iBotPeaches/apktool/releases/download/v${{ inputs.apktool_version }}/apktool_${{ inputs.apktool_version }}.jar" -O apktool.jar
+
+      - name: Download GCam from link
+        run: |
+          curl -fL --retry 3 -A "Mozilla/5.0" "$GCAM_URL" -o GCam.apk
+          ls -lh GCam.apk
+          # sanity check: a real APK is a zip containing AndroidManifest.xml
+          unzip -l GCam.apk | grep -q AndroidManifest.xml || {
+            echo "Downloaded file is not an APK (link is probably a web page, not a direct link)"; exit 1; }
+
+      # -r keeps resources.arsc untouched, smali is still decoded
+      - name: Decompile
+        run: java -jar apktool.jar d -r -f GCam.apk -o out
+
+      # Obfuscated class names differ between GCam builds, so the target is
+      # found by its content instead of by file name.
+      - name: Patch smali
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+
+          CALL = re.compile(
+              r"[ \t]*invoke-virtual \{v\d+, v\d+\}, Landroid/hardware/SensorManager;"
+              r"->createDirectChannel\(Landroid/hardware/HardwareBuffer;\)"
+              r"Landroid/hardware/SensorDirectChannel;\s*\n\s*"
+              r"move-result-object (v\d+)\n")
+
+          hits = []
+          for p in pathlib.Path("out").rglob("*.smali"):
+              s = p.read_text(encoding="utf-8", errors="ignore")
+              if "createDirectChannel" in s:
+                  hits.append((p, s))
+
+          print("files calling createDirectChannel:", [str(p) for p, _ in hits])
+          if not hits:
+              sys.exit("PATCH FAILED: no createDirectChannel call found "
+                       "(this GCam build may not use direct gyro - nothing to patch)")
+
+          total = 0
+          for p, s in hits:
+              new, n = CALL.subn(lambda m: f"    const/4 {m.group(1)}, 0x0\n", s)
+              if n:
+                  p.write_text(new, encoding="utf-8")
+                  print(f"patched {p}: {n} call(s)")
+                  total += n
+          if total == 0:
+              sys.exit("PATCH FAILED: createDirectChannel found but pattern did not match; "
+                       "send the smali around it so the pattern can be adjusted")
+          PY
+
+      - name: Rebuild
+        run: |
+          java -jar apktool.jar b out -o unsigned.apk
+          ls -lh unsigned.apk
+
+      # Keep the same signing key between runs so updates install over each other
+      - name: Restore signing key
+        uses: actions/cache@v4
+        with:
+          path: gcam.jks
+          key: bsg-gcam-signing-key-v1
+
+      - name: Align and sign
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          if [ ! -f gcam.jks ]; then
+            keytool -genkeypair -keystore gcam.jks -storepass android -keypass android \
+              -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=bsg-gcam-patch"
+          fi
+          $BT/zipalign -p -f 4 unsigned.apk aligned.apk
+          $BT/apksigner sign --ks gcam.jks --ks-pass pass:android --key-pass pass:android \
+            --out "GCam-patched.apk" aligned.apk
+          $BT/apksigner verify -v GCam-patched.apk | head -5
+          ls -lh GCam-patched.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GCam-patched
+          path: GCam-patched.apk
