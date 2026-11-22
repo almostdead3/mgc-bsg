@@ -140,10 +140,12 @@ jobs:
           changed = sorted(n for n in oi if pi.get(n) != oi[n])
           print("changed or missing entries:", changed)
           print("new entries:", sorted(set(pi) - set(oi)))
-          bad = [n for n in changed if not re.fullmatch(r"classes\d*\.dex", n)]
-          if bad or set(pi) - set(oi):
+          # pinlist.meta is rewritten by zipalign, so it is allowed to differ
+          bad = [n for n in changed if not re.fullmatch(r"classes\d*\.dex", n) and n != "pinlist.meta"]
+          extra = set(pi) - set(oi) - {"pinlist.meta"}
+          if bad or extra:
               sys.exit(f"UNEXPECTED DIFFERENCES: {bad}")
-          print("OK: only dex files differ from the original")
+          print("OK: only dex files (and zipalign pinlist.meta) differ from the original")
           PY
 
       - uses: actions/upload-artifact@v4
