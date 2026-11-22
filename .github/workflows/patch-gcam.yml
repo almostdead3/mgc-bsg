@@ -9,6 +9,10 @@ on:
       apktool_version:
         description: "apktool version"
         default: "2.9.3"
+      control:
+        description: "Control build: re-sign the ORIGINAL apk with NO patch (for testing the crash)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GCAM_URL: ${{ inputs.gcam_url }}
+      CONTROL: ${{ inputs.control }}
     steps:
       - name: Install tools
         run: |
@@ -39,11 +44,13 @@ jobs:
       # with just those dex files swapped, so manifest, resources and native
       # libs (the MGC shim libs) stay byte-identical.
       - name: Decompile
+        if: ${{ !inputs.control }}
         run: java -jar apktool.jar d -r -f GCam.apk -o out
 
       # Obfuscated class names differ between GCam builds, so the target is
       # found by its content instead of by file name.
       - name: Patch smali
+        if: ${{ !inputs.control }}
         run: |
           python3 - <<'PY'
           import re, sys, pathlib
@@ -91,22 +98,27 @@ jobs:
           PY
 
       - name: Rebuild (only to get the patched dex)
+        if: ${{ !inputs.control }}
         run: |
           java -jar apktool.jar b out -o rebuilt.apk
           ls -lh rebuilt.apk
 
       - name: Put patched dex into the original APK
         run: |
-          mkdir dex_out
-          unzip -o rebuilt.apk $(cat patched_dex.txt) -d dex_out
           cp GCam.apk work.apk
           # drop the old signature, it is invalid after the change anyway
           zip -q -d work.apk 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' 'META-INF/*.EC' 'META-INF/MANIFEST.MF' || true
-          (cd dex_out && zip -q -X "$GITHUB_WORKSPACE/work.apk" $(cat "$GITHUB_WORKSPACE/patched_dex.txt"))
-          for d in $(cat patched_dex.txt); do
-            echo -n "$d: createDirectChannel references left = "
-            unzip -p work.apk "$d" | grep -a -c createDirectChannel || true
-          done
+          if [ "$CONTROL" = "true" ]; then
+            echo "CONTROL BUILD: original APK, no dex change"
+          else
+            mkdir dex_out
+            unzip -o rebuilt.apk $(cat patched_dex.txt) -d dex_out
+            (cd dex_out && zip -q -X "$GITHUB_WORKSPACE/work.apk" $(cat "$GITHUB_WORKSPACE/patched_dex.txt"))
+            for d in $(cat patched_dex.txt); do
+              echo -n "$d: createDirectChannel references left = "
+              unzip -p work.apk "$d" | grep -a -c createDirectChannel || true
+            done
+          fi
 
       # Keep the same signing key between runs so updates install over each other
       - name: Restore signing key
@@ -123,13 +135,16 @@ jobs:
               -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=bsg-gcam-patch"
           fi
           $BT/zipalign -p -f 4 work.apk aligned.apk
+          OUT=GCam-patched.apk
+          [ "$CONTROL" = "true" ] && OUT=GCam-control.apk
           $BT/apksigner sign --ks gcam.jks --ks-pass pass:android --key-pass pass:android \
-            --out "GCam-patched.apk" aligned.apk
-          $BT/apksigner verify -v GCam-patched.apk | head -5
-          ls -lh GCam-patched.apk
+            --out "$OUT" aligned.apk
+          $BT/apksigner verify -v "$OUT" | head -5
+          ls -lh "$OUT"
 
       # Everything except the patched dex files must match the original exactly
       - name: Verify only dex changed
+        if: ${{ !inputs.control }}
         run: |
           python3 - <<'PY'
           import zipfile, re, sys
@@ -140,15 +155,13 @@ jobs:
           changed = sorted(n for n in oi if pi.get(n) != oi[n])
           print("changed or missing entries:", changed)
           print("new entries:", sorted(set(pi) - set(oi)))
-          # pinlist.meta is rewritten by zipalign, so it is allowed to differ
-          bad = [n for n in changed if not re.fullmatch(r"classes\d*\.dex", n) and n != "pinlist.meta"]
-          extra = set(pi) - set(oi) - {"pinlist.meta"}
-          if bad or extra:
+          bad = [n for n in changed if not re.fullmatch(r"classes\d*\.dex", n)]
+          if bad or set(pi) - set(oi):
               sys.exit(f"UNEXPECTED DIFFERENCES: {bad}")
-          print("OK: only dex files (and zipalign pinlist.meta) differ from the original")
+          print("OK: only dex files differ from the original")
           PY
 
       - uses: actions/upload-artifact@v4
         with:
-          name: GCam-patched
-          path: GCam-patched.apk
+          name: ${{ inputs.control && 'GCam-control' || 'GCam-patched' }}
+          path: GCam-*.apk
