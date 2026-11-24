@@ -47,6 +47,27 @@ jobs:
         if: ${{ !inputs.control }}
         run: java -jar apktool.jar d -r -f GCam.apk -o out
 
+      # Diagnostic only: shows where the app looks at its own signing certificate
+      - name: Scan for signature checks
+        if: ${{ !inputs.control }}
+        continue-on-error: true
+        run: |
+          echo "=== Java/smali: APIs that read the app signature ==="
+          grep -rlE "GET_SIGNATURES|GET_SIGNING_CERTIFICATES|getSigningInfo|getApkContentsSigners|Landroid/content/pm/PackageInfo;->signatures|Landroid/content/pm/Signature;->(toByteArray|hashCode|toCharsString)" out --include=*.smali | head -40 || true
+          echo
+          echo "=== smali context (first 6 files) ==="
+          for f in $(grep -rlE "Landroid/content/pm/PackageInfo;->signatures|getApkContentsSigners|Landroid/content/pm/Signature;->(toByteArray|hashCode)" out --include=*.smali | head -6); do
+            echo "##### $f"
+            grep -nE "\.method|PackageInfo;->signatures|getApkContentsSigners|Signature;->|MessageDigest|invoke-static.*Ljava/util/Arrays;->equals|String;->equals|Ljava/lang/System;->exit|Process;->killProcess|\.locals" "$f" | head -80
+          done
+          echo
+          echo "=== native libs: strings that hint at signature / integrity checks ==="
+          mkdir -p libscan && unzip -qo GCam.apk 'lib/*' -d libscan || true
+          for so in $(find libscan -name '*.so' | sort); do
+            echo "##### $so"
+            strings -a "$so" | grep -iE "signature|signing|PackageInfo|getPackageInfo|apk.?path|base\.apk|META-INF|CERT\.|\.RSA|checksum|tamper|integrity" | head -15 || true
+          done
+
       # Obfuscated class names differ between GCam builds, so the target is
       # found by its content instead of by file name.
       - name: Patch smali
