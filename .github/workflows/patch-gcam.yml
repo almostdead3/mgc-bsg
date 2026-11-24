@@ -55,6 +55,10 @@ jobs:
           echo "=== Java/smali: APIs that read the app signature ==="
           grep -rlE "GET_SIGNATURES|GET_SIGNING_CERTIFICATES|getSigningInfo|getApkContentsSigners|Landroid/content/pm/PackageInfo;->signatures|Landroid/content/pm/Signature;->(toByteArray|hashCode|toCharsString)" out --include=*.smali | head -40 || true
           echo
+          echo "=== com/pairip classes ==="
+          ls out/smali/com/pairip 2>/dev/null || true
+          echo "=== SignatureCheck.smali methods ==="
+          grep -nE "^\.method|return-void|throw|Exception" out/smali/com/pairip/SignatureCheck.smali 2>/dev/null | head -40 || true
           echo "=== smali context (first 6 files) ==="
           for f in $(grep -rlE "Landroid/content/pm/PackageInfo;->signatures|getApkContentsSigners|Landroid/content/pm/Signature;->(toByteArray|hashCode)" out --include=*.smali | head -6); do
             echo "##### $f"
@@ -91,6 +95,22 @@ jobs:
                   sys.exit(f"PATCH FAILED: cannot map {path} to a dex file")
               return f"classes{m.group(1)}.dex"
 
+          # --- PairIP signature check: make verifyIntegrity a no-op -------------
+          SIG = pathlib.Path("out/smali/com/pairip/SignatureCheck.smali")
+          dexes = set()
+          if SIG.exists():
+              t = SIG.read_text(encoding="utf-8")
+              m = re.search(r"(\.method [^\n]*verifyIntegrity\(Landroid/content/Context;\)V\n).*?(\.end method)",
+                            t, re.S)
+              if not m:
+                  sys.exit("PATCH FAILED: com/pairip/SignatureCheck has no verifyIntegrity(Context)V")
+              t = t[:m.start()] + m.group(1) + "    .locals 0\n\n    return-void\n" + m.group(2) + t[m.end():]
+              SIG.write_text(t, encoding="utf-8")
+              dexes.add(dex_for(SIG))
+              print("patched", SIG, "-> verifyIntegrity is now a no-op")
+          else:
+              print("NOTE: no com/pairip/SignatureCheck.smali in this build")
+
           hits = []
           for p in pathlib.Path("out").rglob("*.smali"):
               s = p.read_text(encoding="utf-8", errors="ignore")
@@ -102,7 +122,7 @@ jobs:
               sys.exit("PATCH FAILED: no createDirectChannel call found "
                        "(this GCam build may not use direct gyro - nothing to patch)")
 
-          total, dexes = 0, set()
+          total = 0
           for p, s in hits:
               new, n = CALL.subn(lambda m: f"    const/4 {m.group(1)}, 0x0\n", s)
               if n:
@@ -176,8 +196,10 @@ jobs:
           changed = sorted(n for n in oi if pi.get(n) != oi[n])
           print("changed or missing entries:", changed)
           print("new entries:", sorted(set(pi) - set(oi)))
-          bad = [n for n in changed if not re.fullmatch(r"classes\d*\.dex", n)]
-          if bad or set(pi) - set(oi):
+          # pinlist.meta is rewritten by zipalign (offsets into the dex files)
+          bad = [n for n in changed if not re.fullmatch(r"classes\d*\.dex", n) and n != "pinlist.meta"]
+          extra = set(pi) - set(oi) - {"pinlist.meta"}
+          if bad or extra:
               sys.exit(f"UNEXPECTED DIFFERENCES: {bad}")
           print("OK: only dex files differ from the original")
           PY
